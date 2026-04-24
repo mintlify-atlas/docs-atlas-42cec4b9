@@ -1,0 +1,99 @@
+---
+title: "FeeCalculator: duration-based, ceiling-rounded fee engine"
+description: "FeeCalculator computes parking fees by ceiling-rounding duration to whole hours and multiplying by a fixed rate per vehicle type: $2, $5, or $10 per hour."
+---
+
+`FeeCalculator` is a stateless component with a single responsibility: given a `Vehicle` and an exit timestamp, compute the total fee owed. It holds no mutable state, requires no database reference, and can be called from any thread without synchronization. The rounding policy is always ceiling to the nearest whole hour — a session of 1 hour and 1 minute is billed as 2 hours, not 1.
+
+## Hourly rates
+
+| Vehicle type | Rate |
+|---|---|
+| `MOTORCYCLE` | $2.00 / hr |
+| `CAR` | $5.00 / hr |
+| `BUS` | $10.00 / hr |
+
+Rates are stored in a private static final `Map<VehicleType, Double>` initialized at class load time. They are not configurable at runtime.
+
+```java
+private static final Map<VehicleType, Double> HOURLY_RATES = Map.of(
+    VehicleType.MOTORCYCLE, 2.0,
+    VehicleType.CAR, 5.0,
+    VehicleType.BUS, 10.0
+);
+```
+
+## Methods
+
+### calculateFee
+
+```java
+public double calculateFee(Vehicle vehicle, LocalDateTime exitTime)
+```
+
+Computes the total parking fee for a completed session. The method measures the duration between the vehicle's entry time and `exitTime`, rounds up to the nearest whole hour, and multiplies by the vehicle type's hourly rate.
+
+<ParamField path="vehicle" type="Vehicle" required>
+  The `Vehicle` record for the session. The method reads `vehicle.entryTime()` to determine when parking began and `vehicle.type()` to look up the correct hourly rate.
+</ParamField>
+
+<ParamField path="exitTime" type="LocalDateTime" required>
+  The moment the vehicle exits. In normal operation this is `LocalDateTime.now()` captured inside `ParkingManager.checkOut`, ensuring the fee reflects the actual duration.
+</ParamField>
+
+#### Rounding logic
+
+```java
+Duration duration = Duration.between(vehicle.entryTime(), exitTime);
+double hours = duration.toHours() + (duration.toMinutesPart() > 0 ? 1 : 0);
+```
+
+`Duration.toHours()` truncates to whole hours. If any minutes remain (checked with `toMinutesPart() > 0`), one additional hour is added. Seconds and nanoseconds are not inspected separately — the rounding is based on minutes only.
+
+<Note>
+  A session of exactly 2 hours produces `toHours() = 2` and `toMinutesPart() = 0`, so no extra hour is added. A session of 2 hours and 1 second produces `toMinutesPart() = 0` as well — only minute-level granularity is used. For sub-minute stays, the fee rounds to a minimum of 1 hour.
+</Note>
+
+#### Calculation examples
+
+| Session duration | Billed hours | Vehicle type | Fee |
+|---|---|---|---|
+| 45 min | 1 hr | `CAR` | $5.00 |
+| 1 hr 15 min | 2 hr | `CAR` | $10.00 |
+| 2 hr exactly | 2 hr | `CAR` | $10.00 |
+| 30 min | 1 hr | `MOTORCYCLE` | $2.00 |
+| 3 hr 1 min | 4 hr | `BUS` | $40.00 |
+
+#### Usage example
+
+```java
+FeeCalculator calculator = new FeeCalculator();
+
+LocalDateTime entry = LocalDateTime.of(2026, 4, 24, 9, 0);
+LocalDateTime exit  = LocalDateTime.of(2026, 4, 24, 10, 45);
+
+// Simulated vehicle record
+Vehicle vehicle = new Vehicle("ABC-1234", VehicleType.CAR, entry, assignedSpot);
+
+double fee = calculator.calculateFee(vehicle, exit);
+// Duration = 1h 45min → rounds up to 2 hours → 2 * $5.00 = $10.00
+System.out.printf("Fee: $%.2f%n", fee); // Fee: $10.00
+```
+
+In production, `calculateFee` is called exclusively by `ParkingManager.checkOut`, which passes the live `LocalDateTime.now()` as the exit time:
+
+```java
+LocalDateTime exitTime = LocalDateTime.now();
+double fee = feeCalculator.calculateFee(vehicle, exitTime);
+```
+
+## Related components
+
+<CardGroup cols={2}>
+  <Card title="ParkingManager" icon="sitemap" href="/components/parking-manager">
+    Calls calculateFee during checkOut and passes the result into the transaction record.
+  </Card>
+  <Card title="Architecture overview" icon="book-open" href="/architecture/overview">
+    See where FeeCalculator fits in the full data flow.
+  </Card>
+</CardGroup>

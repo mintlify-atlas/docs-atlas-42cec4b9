@@ -1,0 +1,128 @@
+---
+title: "ParkingSpotAllocator: write-lock spot selection and release"
+description: "ParkingSpotAllocator uses a three-filter, lowest-floor-first strategy with a write lock to guarantee no double-booking under concurrent check-ins."
+---
+
+`ParkingSpotAllocator` is responsible for all spot assignment and release decisions in the Smart Parking LLD system. It holds a reference to `ParkingDatabase` and acquires the write lock on every state-changing operation. Because `ParkingSpot` is a Java record — and therefore immutable — "updating" an occupied or freed spot means creating a new record and replacing the old entry in the database map. This design avoids mutable shared state at the spot level while still allowing the map itself to be updated atomically under the write lock.
+
+## Methods
+
+### allocateSpot
+
+```java
+public Optional<ParkingSpot> allocateSpot(VehicleType type)
+```
+
+Selects the best available spot for the given vehicle type and marks it as occupied. The method acquires the write lock before streaming over `database.spots` and returns `Optional.empty()` if no qualifying spot exists.
+
+<ParamField path="type" type="VehicleType" required>
+  The vehicle type requesting a spot. Used as the key for both type matching and size validation during the filter pipeline.
+</ParamField>
+
+#### Three-filter pipeline
+
+Allocation applies three sequential filters to the spots stream before selecting a winner:
+
+<Steps>
+  <Step title="Occupancy filter">
+    `!spot.isOccupied()` — eliminates all spots already assigned to a vehicle.
+  </Step>
+  <Step title="Type match filter">
+    `spot.supportedType() == type` — keeps only spots designated for the requested vehicle type.
+  </Step>
+  <Step title="Size filter">
+    `spot.size() >= type.getSizeFactor()` — ensures the spot is physically large enough for the vehicle. This prevents a motorcycle-sized spot from being assigned to a bus even if the type flags matched.
+  </Step>
+</Steps>
+
+#### Sorting strategy
+
+After filtering, the stream uses a two-level comparator:
+
+```java
+.min(Comparator.comparingInt(ParkingSpot::floor)
+    .thenComparingInt(ParkingSpot::spotId))
+```
+
+The lowest floor is preferred first, and among spots on the same floor, the lowest `spotId` wins. This favors spots closest to the entrance and produces deterministic results when multiple spots are equally eligible.
+
+#### Immutable record update
+
+Because `ParkingSpot` is a record, you cannot set `isOccupied` to `true` in place. Instead, `allocateSpot` constructs a new `ParkingSpot` with `isOccupied = true` and puts it back into `database.spots` under the same key:
+
+```java
+public Optional<ParkingSpot> allocateSpot(VehicleType type) {
+    database.lock.writeLock().lock();
+    try {
+        return database.spots.values().stream()
+            .filter(spot -> !spot.isOccupied())
+            .filter(spot -> spot.supportedType() == type)
+            .filter(spot -> spot.size() >= type.getSizeFactor())
+            .min(Comparator.comparingInt(ParkingSpot::floor)
+                .thenComparingInt(ParkingSpot::spotId))
+            .map(spot -> {
+                ParkingSpot occupiedSpot = new ParkingSpot(
+                    spot.spotId(), spot.floor(), spot.supportedType(), true, spot.size()
+                );
+                database.spots.put(spot.spotId(), occupiedSpot);
+                return occupiedSpot;
+            });
+    } finally {
+        database.lock.writeLock().unlock();
+    }
+}
+```
+
+<Note>
+  The write lock is held for the entire stream traversal and map update. This prevents two concurrent `checkIn` calls from selecting the same spot. The lock is always released in the `finally` block, even if the stream throws.
+</Note>
+
+The method returns `Optional.empty()` when no spot passes all three filters. `ParkingManager.checkIn` treats an empty result as an `IllegalStateException` and completes the future exceptionally.
+
+### releaseSpot
+
+```java
+public void releaseSpot(int spotId)
+```
+
+Marks the given spot as unoccupied so it can be allocated to future vehicles. Like `allocateSpot`, this method acquires the write lock and creates a new `ParkingSpot` record to replace the occupied one.
+
+<ParamField path="spotId" type="int" required>
+  The numeric ID of the spot to release. If no spot with this ID exists in the database, the method exits silently without error.
+</ParamField>
+
+```java
+public void releaseSpot(int spotId) {
+    database.lock.writeLock().lock();
+    try {
+        ParkingSpot spot = database.spots.get(spotId);
+        if (spot != null) {
+            ParkingSpot freeSpot = new ParkingSpot(
+                spot.spotId(), spot.floor(), spot.supportedType(), false, spot.size()
+            );
+            database.spots.put(spot.spotId(), freeSpot);
+        }
+    } finally {
+        database.lock.writeLock().unlock();
+    }
+}
+```
+
+<Tip>
+  `releaseSpot` is called by `ParkingManager.checkOut` after the fee is computed. The spot ID comes from `vehicle.assignedSpot().spotId()`, which was captured at check-in time, so no additional database lookup is needed.
+</Tip>
+
+## Why records instead of mutable objects
+
+Using Java records for `ParkingSpot` eliminates an entire class of bugs: once a spot is created, its fields can never be silently modified by another thread. All mutations go through the controlled path of creating a new record and replacing the map entry under the write lock. The trade-off is slightly more object allocation, which is negligible for a parking lot workload.
+
+## Related components
+
+<CardGroup cols={2}>
+  <Card title="ParkingDatabase" icon="database" href="/components/parking-database">
+    Owns the spot map and the ReadWriteLock that ParkingSpotAllocator acquires.
+  </Card>
+  <Card title="ParkingManager" icon="sitemap" href="/components/parking-manager">
+    Calls allocateSpot during checkIn and releaseSpot during checkOut.
+  </Card>
+</CardGroup>

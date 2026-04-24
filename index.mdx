@@ -1,97 +1,72 @@
 ---
-title: "Introduction"
-description: "Welcome to the new home for your documentation"
+title: "Smart Parking LLD: Backend System Design Reference"
+description: "A low-level design reference for a smart parking lot backend in Java covering vehicle management, automatic spot allocation, and fee calculation."
 ---
 
-## Setting up
+Smart Parking LLD is a complete low-level design (LLD) reference implementation for a backend parking lot management system. Written in Java 23, it demonstrates how to architect a concurrent, multi-floor parking system with automatic vehicle-type-based spot allocation, real-time availability tracking, and time-based fee calculation.
 
-Get your documentation site up and running in minutes.
-
-<Card
-  title="Start here"
-  icon="rocket"
-  href="/quickstart"
-  horizontal
->
-  Follow our three step quickstart guide.
-</Card>
-
-## Make it yours
-
-Design a docs site that looks great and empowers your users.
-
-<Columns cols={2}>
-  <Card
-    title="Edit locally"
-    icon="pen-to-square"
-    href="/development"
-  >
-    Edit your docs locally and preview them in real time.
+<CardGroup cols={2}>
+  <Card title="Introduction" icon="book-open" href="/introduction">
+    Learn what Smart Parking LLD covers and the design goals behind it.
   </Card>
-  <Card
-    title="Customize your site"
-    icon="palette"
-    href="/essentials/settings"
-  >
-    Customize the design and colors of your site to match your brand.
+  <Card title="Quickstart" icon="rocket" href="/quickstart">
+    Spin up a parking lot instance and perform your first check-in and check-out.
   </Card>
-    <Card
-    title="Set up navigation"
-    icon="map"
-    href="/essentials/navigation"
-  >
-    Organize your docs to help users find what they need and succeed with your product.
+  <Card title="Architecture Overview" icon="diagram-project" href="/architecture/overview">
+    Understand how ParkingManager, the allocator, fee calculator, and database connect.
   </Card>
-  <Card
-    title="API documentation"
-    icon="terminal"
-    href="/api-reference/introduction"
-  >
-    Auto-generate API documentation from OpenAPI specifications.
+  <Card title="Core Components" icon="cubes" href="/components/parking-manager">
+    Explore each component — ParkingManager, SpotAllocator, FeeCalculator, and more.
   </Card>
-</Columns>
+</CardGroup>
 
-## Create beautiful pages
+## How it works
 
-Everything you need to create world-class documentation.
+Smart Parking LLD organizes a parking lot into floors and spots, each typed for a specific vehicle category. When a vehicle arrives, the system finds the best available spot on the lowest possible floor, records the entry time, and issues the vehicle a spot assignment. On exit, it computes a duration-based fee and frees the spot for the next vehicle.
 
-<Columns cols={2}>
-  <Card
-    title="Write with MDX"
-    icon="pen-fancy"
-    href="/essentials/markdown"
-  >
-    Use MDX to style your docs pages.
-  </Card>
-  <Card
-    title="Code samples"
-    icon="code"
-    href="/essentials/code"
-  >
-    Add sample code to demonstrate how to use your product.
-  </Card>
-  <Card
-    title="Images"
-    icon="image"
-    href="/essentials/images"
-  >
-    Display images and other media.
-  </Card>
-  <Card
-    title="Reusable snippets"
-    icon="recycle"
-    href="/essentials/reusable-snippets"
-  >
-    Write once and reuse across your docs.
-  </Card>
-</Columns>
+<Steps>
+  <Step title="Instantiate a ParkingManager">
+    Create a manager for your lot by specifying the number of floors and spots per floor.
+    ```java
+    ParkingManager manager = new ParkingManager(3, 10);
+    ```
+  </Step>
+  <Step title="Check in a vehicle">
+    Call `checkIn` with a license plate and vehicle type. The system allocates the optimal spot asynchronously.
+    ```java
+    manager.checkIn("ABC123", VehicleType.CAR)
+        .thenAccept(vehicle ->
+            System.out.println("Spot: " + vehicle.assignedSpot().spotId()));
+    ```
+  </Step>
+  <Step title="Check out and collect the fee">
+    Call `checkOut` to release the spot and receive a `ParkingTransaction` with the computed fee.
+    ```java
+    manager.checkOut("ABC123")
+        .thenAccept(tx -> System.out.println("Fee: $" + tx.fee()));
+    ```
+  </Step>
+  <Step title="Query real-time availability">
+    Check how many spots remain for a given vehicle type at any time.
+    ```java
+    int available = manager.getAvailableSpots(VehicleType.CAR);
+    ```
+  </Step>
+</Steps>
 
-## Need inspiration?
+## Key features
 
-<Card
-  title="See complete examples"
-  icon="stars"
-  href="https://mintlify.com/customers"
->
-  Browse our showcase of exceptional documentation sites.
-</Card>
+<CardGroup cols={2}>
+  <Card title="Automatic spot allocation" icon="circle-check">
+    Spots are assigned by vehicle size and type, always preferring the lowest floor and lowest spot ID.
+  </Card>
+  <Card title="Concurrent operations" icon="bolt">
+    `ReadWriteLock` and `ConcurrentHashMap` make every operation thread-safe under high load.
+  </Card>
+  <Card title="Async API" icon="arrows-spin">
+    `checkIn` and `checkOut` return `CompletableFuture` so callers are never blocked.
+  </Card>
+  <Card title="Immutable data model" icon="lock">
+    All entities (`Vehicle`, `ParkingSpot`, `ParkingTransaction`) are Java records — safe to share across threads.
+  </Card>
+</CardGroup>

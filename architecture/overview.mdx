@@ -1,0 +1,109 @@
+---
+title: "Architecture overview: four-component parking system"
+description: "See how ParkingManager, ParkingSpotAllocator, FeeCalculator, and ParkingDatabase are wired together and how data flows through each parking operation."
+---
+
+Smart Parking LLD is built around four collaborating components with clearly separated responsibilities. `ParkingManager` is the single public entry point — it owns the thread pool and orchestrates every operation. Below it, `ParkingSpotAllocator` handles all spot assignment logic, `FeeCalculator` computes charges from parking duration, and `ParkingDatabase` holds the authoritative in-memory state for spots, active sessions, and completed transactions. No component reaches outside its responsibility, and no external caller needs to interact with anything other than `ParkingManager`.
+
+## Component responsibilities
+
+| Component | Responsibility |
+|---|---|
+| `ParkingManager` | Public API, async execution, component wiring |
+| `ParkingSpotAllocator` | Spot selection and release |
+| `FeeCalculator` | Duration-based fee computation |
+| `ParkingDatabase` | In-memory state: spots, active vehicles, transactions |
+
+## Architecture diagram
+
+```
+                        ┌─────────────────────────┐
+  checkIn() ──────────► │                         │
+  checkOut() ─────────► │     ParkingManager      │
+  getAvailableSpots() ► │   (ExecutorService x10) │
+                        └──────────┬──────────────┘
+                                   │
+               ┌───────────────────┼───────────────────┐
+               │                   │                   │
+               ▼                   ▼                   ▼
+  ┌────────────────────┐  ┌────────────────┐  ┌───────────────────┐
+  │ ParkingSpotAllocat │  │ FeeCalculator  │  │  ParkingDatabase  │
+  │  allocateSpot()    │  │ calculateFee() │  │  spots (CHM)      │
+  │  releaseSpot()     │  └────────────────┘  │  activeVehicles   │
+  └────────┬───────────┘                      │  transactions     │
+           │           reads/writes           │                   │
+           └─────────────────────────────────►│  ReentrantRWLock  │
+                                              └───────────────────┘
+```
+
+`ParkingSpotAllocator` holds a reference to `ParkingDatabase` and acquires the write lock on every allocation or release. `ParkingManager` holds a reference to the allocator, the database (for read-only queries like `getAvailableSpots`), and the fee calculator. `FeeCalculator` is stateless and requires no database reference — it works purely from the `Vehicle` record passed to it at checkout.
+
+## Component wiring
+
+All four components are wired together in the `ParkingManager` constructor. The database is created first, then passed into the allocator. Neither the allocator nor the fee calculator is exposed publicly.
+
+```java
+public ParkingManager(int floors, int spotsPerFloor) {
+    this.database = new ParkingDatabase(floors, spotsPerFloor);
+    this.allocator = new ParkingSpotAllocator(database);
+    this.feeCalculator = new FeeCalculator();
+}
+```
+
+<Note>
+  The `ExecutorService` is created with a fixed pool of 10 threads. All `CompletableFuture` tasks submitted by `checkIn` and `checkOut` run on this pool, not on the calling thread.
+</Note>
+
+## Data flow: check-in
+
+<Steps>
+  <Step title="Caller invokes checkIn">
+    The caller provides a license plate and `VehicleType`. `ParkingManager.checkIn` wraps the work in a `CompletableFuture` and submits it to the executor.
+  </Step>
+  <Step title="Allocator selects a spot">
+    `ParkingSpotAllocator.allocateSpot` acquires the write lock, streams over all spots, filters by type and occupancy, and selects the lowest floor and lowest spot ID match. The matching spot is replaced with an occupied copy and written back to the database.
+  </Step>
+  <Step title="Vehicle record is created">
+    A `Vehicle` record is constructed with the license plate, type, current timestamp, and the allocated spot. It is stored in `database.activeVehicles`.
+  </Step>
+  <Step title="Future resolves">
+    The `CompletableFuture` completes with the `Vehicle` record. If no spot was available, it completes exceptionally with `IllegalStateException`.
+  </Step>
+</Steps>
+
+## Data flow: check-out
+
+<Steps>
+  <Step title="Caller invokes checkOut">
+    The caller provides the license plate. `ParkingManager.checkOut` submits the work to the executor pool.
+  </Step>
+  <Step title="Vehicle is removed from active sessions">
+    `database.activeVehicles.remove(licensePlate)` atomically retrieves and removes the vehicle. If the plate is not found, the future completes exceptionally.
+  </Step>
+  <Step title="Fee is calculated">
+    `FeeCalculator.calculateFee` measures the duration between `vehicle.entryTime()` and the current time, rounds up to the next whole hour, and multiplies by the type's hourly rate.
+  </Step>
+  <Step title="Spot is released">
+    `ParkingSpotAllocator.releaseSpot` acquires the write lock and replaces the spot with an unoccupied copy.
+  </Step>
+  <Step title="Transaction is recorded">
+    A `ParkingTransaction` record with a UUID, the vehicle, entry time, exit time, and fee is written to `database.transactions`. The future resolves with this transaction.
+  </Step>
+</Steps>
+
+## Explore components
+
+<CardGroup cols={2}>
+  <Card title="ParkingManager" icon="sitemap" href="/components/parking-manager">
+    Public API entry point, async execution, and component orchestration.
+  </Card>
+  <Card title="ParkingSpotAllocator" icon="map-pin" href="/components/spot-allocator">
+    Spot selection strategy, write-lock usage, and release logic.
+  </Card>
+  <Card title="FeeCalculator" icon="calculator" href="/components/fee-calculator">
+    Duration measurement, hourly rates, and ceiling rounding.
+  </Card>
+  <Card title="ParkingDatabase" icon="database" href="/components/parking-database">
+    In-memory state management, ConcurrentHashMap usage, and initialization.
+  </Card>
+</CardGroup>

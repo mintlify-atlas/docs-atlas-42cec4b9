@@ -1,0 +1,114 @@
+---
+title: "Data model: records, enums, and spot initialization"
+description: "Reference for all four domain types — VehicleType, ParkingSpot, Vehicle, and ParkingTransaction — including field definitions and immutability design choices."
+---
+
+The Smart Parking data model is built entirely from Java records and a single enum. Records were chosen deliberately: they are immutable by construction, generate correct `equals`, `hashCode`, and `toString` implementations automatically, and can be passed freely between threads without defensive copying. The only mutable state in the system lives in the three `ConcurrentHashMap` collections inside `ParkingDatabase` — the domain objects themselves never change after creation.
+
+## VehicleType
+
+`VehicleType` is the enum that drives both spot compatibility checks and fee calculation. Every vehicle type carries a `sizeFactor` that the allocator uses to filter which spots a vehicle may occupy.
+
+```java
+public enum VehicleType {
+    MOTORCYCLE(1.0), CAR(2.0), BUS(4.0);
+    private final double sizeFactor;
+    VehicleType(double sizeFactor) { this.sizeFactor = sizeFactor; }
+    public double getSizeFactor() { return sizeFactor; }
+}
+```
+
+| Constant | Size factor | Hourly rate |
+|---|---|---|
+| `MOTORCYCLE` | 1.0 | $2.00 |
+| `CAR` | 2.0 | $5.00 |
+| `BUS` | 4.0 | $10.00 |
+
+The size factor serves a dual purpose. First, it is stored on the `ParkingSpot` record as the `size` field at initialization time, so each spot knows what size class it belongs to. Second, it is used as a filter predicate in `ParkingSpotAllocator.allocateSpot` — a vehicle is only offered spots where `spot.size() >= type.getSizeFactor()`. This means spot size and vehicle size use the same scale, making compatibility checks a simple numeric comparison.
+
+<Note>
+  The hourly rates are not stored on the enum — they live in a static `Map` inside `FeeCalculator`. This keeps billing logic isolated from the vehicle type definition.
+</Note>
+
+## ParkingSpot
+
+`ParkingSpot` is a Java record representing a single physical parking bay. Every field is final and set at construction time.
+
+```java
+public record ParkingSpot(int spotId, int floor, VehicleType supportedType, boolean isOccupied, double size) {}
+```
+
+| Field | Type | Description |
+|---|---|---|
+| `spotId` | `int` | Unique integer identifier, assigned sequentially starting at 1 |
+| `floor` | `int` | Floor number, 1-indexed |
+| `supportedType` | `VehicleType` | The vehicle type this spot was built for |
+| `isOccupied` | `boolean` | Whether a vehicle is currently assigned to this spot |
+| `size` | `double` | The size factor copied from `supportedType.getSizeFactor()` at initialization |
+
+Because `ParkingSpot` is a record, occupancy changes are modeled as replacements, not mutations. When a spot is allocated, the allocator creates a new `ParkingSpot` with `isOccupied = true` and writes it over the old entry in the map. The same pattern applies on release.
+
+```java
+ParkingSpot occupiedSpot = new ParkingSpot(
+    spot.spotId(), spot.floor(), spot.supportedType(), true, spot.size()
+);
+database.spots.put(spot.spotId(), occupiedSpot);
+```
+
+### Spot initialization
+
+Spots are created in `ParkingDatabase.initializeParkingSpots` by iterating over every floor and every position per floor. The vehicle type for each spot is assigned using a modulo pattern on the position index:
+
+```java
+VehicleType type = i % 3 == 0 ? VehicleType.MOTORCYCLE :
+                 i % 3 == 1 ? VehicleType.CAR : VehicleType.BUS;
+```
+
+This produces a repeating `MOTORCYCLE → CAR → BUS` pattern across each floor. For a floor with 9 spots, positions 0, 3, 6 are motorcycle bays; positions 1, 4, 7 are car bays; positions 2, 5, 8 are bus bays.
+
+<Tip>
+  Spot IDs are assigned sequentially across all floors in a single counter starting at 1. Floor 1 gets IDs 1 through `spotsPerFloor`, floor 2 gets the next range, and so on.
+</Tip>
+
+## Vehicle
+
+`Vehicle` is a record created at check-in time. It captures the complete state of an active parking session.
+
+```java
+public record Vehicle(String licensePlate, VehicleType type, LocalDateTime entryTime, ParkingSpot assignedSpot) {}
+```
+
+| Field | Type | Description |
+|---|---|---|
+| `licensePlate` | `String` | The vehicle's license plate, used as the session key in `activeVehicles` |
+| `type` | `VehicleType` | The vehicle's type, used by `FeeCalculator` to look up the hourly rate |
+| `entryTime` | `LocalDateTime` | Timestamp captured at the moment `checkIn` executes, before the future resolves |
+| `assignedSpot` | `ParkingSpot` | The `ParkingSpot` record returned by the allocator |
+
+The `Vehicle` record is stored in `database.activeVehicles` keyed by `licensePlate`. At check-out, it is atomically removed from the map and passed to `FeeCalculator`, which reads `entryTime` and `type` to compute the fee.
+
+<Note>
+  `assignedSpot` is the spot record as it existed at allocation time. Its `spotId` is used by `releaseSpot` to look up and free the correct entry in `database.spots`.
+</Note>
+
+## ParkingTransaction
+
+`ParkingTransaction` is the final record produced at check-out. It is immutable and serves as the permanent audit record for a completed session.
+
+```java
+public record ParkingTransaction(String transactionId, Vehicle vehicle, LocalDateTime entryTime, LocalDateTime exitTime, double fee) {}
+```
+
+| Field | Type | Description |
+|---|---|---|
+| `transactionId` | `String` | A UUID generated with `UUID.randomUUID().toString()` at check-out |
+| `vehicle` | `Vehicle` | The complete `Vehicle` record for the session, preserved as-is |
+| `entryTime` | `LocalDateTime` | The entry time, copied from `vehicle.entryTime()` |
+| `exitTime` | `LocalDateTime` | The current time at the moment check-out executes |
+| `fee` | `double` | The computed fee returned by `FeeCalculator.calculateFee` |
+
+Transactions are stored in `database.transactions` keyed by `transactionId`. They are never removed or updated — each represents a permanent record of a completed parking session.
+
+<Warning>
+  `entryTime` is stored on both `Vehicle` and `ParkingTransaction`. The transaction's `entryTime` is copied from the vehicle record at check-out and is included for convenience when reading transaction data without needing to traverse the nested `vehicle` field.
+</Warning>

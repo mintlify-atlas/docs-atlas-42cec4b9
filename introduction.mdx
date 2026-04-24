@@ -1,0 +1,53 @@
+---
+title: "Smart Parking LLD: A Multi-Floor Java Backend Reference"
+description: "Explore the design goals, system components, and vehicle types behind this thread-safe, async Java 23 parking lot low-level design implementation."
+---
+
+Smart Parking LLD is a Java 23 reference implementation of a backend parking lot management system built around three core design principles: thread safety under concurrent load, immutability at the data layer, and non-blocking async operations throughout the public API. It models a real-world multi-floor parking facility where vehicles are assigned spots by type, fees are calculated from actual parking duration, and every operation is safe to call from multiple threads simultaneously.
+
+## Design goals
+
+The system prioritizes correctness and composability over simplicity. Each goal directly shapes how the components are structured:
+
+- **Thread safety** — Spot allocation and release use `ReadWriteLock` to protect shared state. Active sessions are tracked in a `ConcurrentHashMap`, making simultaneous check-ins safe without global locking.
+- **Immutability** — All domain entities (`Vehicle`, `ParkingSpot`, `ParkingTransaction`) are Java records. They carry no mutable state and can be passed freely across threads without defensive copying.
+- **Async operations** — `checkIn` and `checkOut` return `CompletableFuture`, so callers are never blocked waiting for allocation or fee computation. Error paths surface as exceptions on the future rather than checked return values.
+
+## System components
+
+Four components collaborate to handle every parking operation:
+
+**ParkingManager** is the single entry point for all external interactions. It accepts check-in and check-out requests, delegates spot selection to the allocator, fee computation to the fee calculator, and session tracking to the database. It owns the thread pool used for async operations.
+
+**ParkingSpotAllocator** selects the best available spot for an incoming vehicle. It prefers lower floors and lower spot IDs, and enforces vehicle-type compatibility so that, for example, a bus cannot be assigned to a motorcycle bay.
+
+**FeeCalculator** computes the charge for a completed session. It looks up the per-hour rate for the vehicle's type, measures the elapsed duration, and returns the total fee as part of a `ParkingTransaction`.
+
+**ParkingDatabase** maintains the authoritative record of active sessions. It stores entry timestamps and spot assignments, and provides the data `FeeCalculator` needs when a vehicle checks out.
+
+## Vehicle types
+
+The system supports three vehicle categories, each with a size factor that controls which spots it can occupy and an hourly rate that determines what it costs to park:
+
+| Type         | Size factor | Hourly rate |
+| ------------ | ----------- | ----------- |
+| `MOTORCYCLE` | 1.0         | $2/hr       |
+| `CAR`        | 2.0         | $5/hr       |
+| `BUS`        | 4.0         | $10/hr      |
+
+The size factor is defined on the `VehicleType` enum and is used by the allocator to filter compatible spots. A spot sized for a car (factor 2.0) will not be offered to a bus (factor 4.0).
+
+<Note>
+  All three vehicle types share the same `checkIn` / `checkOut` API. The `VehicleType` argument to `checkIn` is the only thing that changes the allocation and fee behavior.
+</Note>
+
+## Explore further
+
+<CardGroup cols={2}>
+  <Card title="Architecture overview" icon="diagram-project" href="/architecture/overview">
+    See how ParkingManager, the allocator, fee calculator, and database fit together as a system.
+  </Card>
+  <Card title="Core components" icon="cubes" href="/components/parking-manager">
+    Read the detailed reference for each component, including method signatures and concurrency guarantees.
+  </Card>
+</CardGroup>

@@ -1,0 +1,89 @@
+---
+title: "Query real-time parking spot availability per vehicle type"
+description: "Use ParkingManager.getAvailableSpots to check how many free spots remain for each vehicle type. Understand spot distribution and locking behavior."
+---
+
+`ParkingManager.getAvailableSpots(VehicleType type)` returns the number of unoccupied spots designated for a given vehicle type at any point in time. It uses a read lock, so multiple threads can query availability simultaneously without blocking each other — only allocation and release operations cause a brief pause.
+
+## Usage
+
+```java
+ParkingManager manager = new ParkingManager(3, 10); // 3 floors, 10 spots each
+
+int motorcycleSpots = manager.getAvailableSpots(VehicleType.MOTORCYCLE);
+int carSpots        = manager.getAvailableSpots(VehicleType.CAR);
+int busSpots        = manager.getAvailableSpots(VehicleType.BUS);
+
+System.out.println("Motorcycle spots: " + motorcycleSpots);
+System.out.println("Car spots:        " + carSpots);
+System.out.println("Bus spots:        " + busSpots);
+```
+
+## How spots are distributed at initialization
+
+`ParkingDatabase` assigns spot types in a round-robin pattern based on each spot's index within a floor:
+
+```java
+VehicleType type = i % 3 == 0 ? VehicleType.MOTORCYCLE :
+                   i % 3 == 1 ? VehicleType.CAR : VehicleType.BUS;
+```
+
+For a **3-floor × 10-spot** lot (30 spots total), the distribution per floor is:
+
+| Index within floor (i) | Type |
+|---|---|
+| 0, 3, 6, 9 | MOTORCYCLE |
+| 1, 4, 7 | CAR |
+| 2, 5, 8 | BUS |
+
+That gives **4 MOTORCYCLE + 3 CAR + 3 BUS per floor**, or **12 / 9 / 9** across the whole lot.
+
+<Note>
+  The total spot count is `floors × spotsPerFloor`. The type split is always 4:3:3 (MOTORCYCLE:CAR:BUS) per floor when `spotsPerFloor` is 10 — but varies for other values since the pattern depends on `i % 3`.
+</Note>
+
+## Concurrency behavior
+
+`getAvailableSpots` acquires a **read lock** before streaming the spots map:
+
+```java
+public int getAvailableSpots(VehicleType type) {
+    database.lock.readLock().lock();
+    try {
+        return (int) database.spots.values().stream()
+            .filter(spot -> !spot.isOccupied())
+            .filter(spot -> spot.supportedType() == type)
+            .count();
+    } finally {
+        database.lock.readLock().unlock();
+    }
+}
+```
+
+- Multiple threads calling `getAvailableSpots` concurrently will not block each other.
+- An in-progress `allocateSpot` or `releaseSpot` (both use a write lock) will briefly pause availability queries until it completes.
+
+<Tip>
+  Call `getAvailableSpots` before `checkIn` to give drivers early feedback and avoid the `IllegalStateException` thrown when no spots remain.
+</Tip>
+
+## Example: admission gate pattern
+
+```java
+public void admitVehicle(ParkingManager manager, String plate, VehicleType type) {
+    if (manager.getAvailableSpots(type) == 0) {
+        System.out.println("Lot full for " + type + ". Cannot admit " + plate);
+        return;
+    }
+    manager.checkIn(plate, type)
+        .thenAccept(v -> System.out.println("Admitted to spot " + v.assignedSpot().spotId()))
+        .exceptionally(ex -> {
+            System.err.println("Admit failed: " + ex.getCause().getMessage());
+            return null;
+        });
+}
+```
+
+<Warning>
+  There is a small TOCTOU (time-of-check/time-of-use) window between `getAvailableSpots` and `checkIn`. Another thread could claim the last spot in between. The `IllegalStateException` from `checkIn` is the authoritative failure signal — always handle it.
+</Warning>

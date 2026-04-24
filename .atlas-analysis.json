@@ -1,0 +1,73 @@
+{
+  "projectType": "general",
+  "projectName": "Smart Parking LLD",
+  "projectDescription": "A low-level design (LLD) reference implementation of a backend smart parking lot system in Java, covering vehicle entry/exit, automatic spot allocation, and fee calculation.",
+  "theme": "luma",
+  "primaryColor": "#2563EB",
+  "lightColor": "#DBEAFE",
+  "darkColor": "#1E3A8A",
+  "navigation": {
+    "tabs": [
+      {
+        "tab": "Documentation",
+        "groups": [
+          {
+            "group": "Get Started",
+            "pages": [
+              "introduction",
+              "quickstart"
+            ]
+          },
+          {
+            "group": "Architecture",
+            "pages": [
+              "architecture/overview",
+              "architecture/data-model",
+              "architecture/concurrency"
+            ]
+          },
+          {
+            "group": "Core Components",
+            "pages": [
+              "components/parking-manager",
+              "components/spot-allocator",
+              "components/fee-calculator",
+              "components/parking-database"
+            ]
+          },
+          {
+            "group": "Guides",
+            "pages": [
+              "guides/vehicle-checkin",
+              "guides/vehicle-checkout",
+              "guides/spot-availability",
+              "guides/extending"
+            ]
+          }
+        ]
+      }
+    ]
+  },
+  "keyFeatures": [
+    "Automatic spot allocation based on vehicle type and size",
+    "Multi-floor parking lot support",
+    "Thread-safe concurrent operations using ReadWriteLock and ConcurrentHashMap",
+    "Asynchronous check-in and check-out with CompletableFuture",
+    "Duration-based fee calculation with per-vehicle-type hourly rates",
+    "Immutable data model using Java records",
+    "Real-time availability tracking"
+  ],
+  "publicApiSurface": [
+    "ParkingManager(int floors, int spotsPerFloor)",
+    "ParkingManager.checkIn(String licensePlate, VehicleType type): CompletableFuture<Vehicle>",
+    "ParkingManager.checkOut(String licensePlate): CompletableFuture<ParkingTransaction>",
+    "ParkingManager.getAvailableSpots(VehicleType type): int",
+    "ParkingSpotAllocator.allocateSpot(VehicleType type): Optional<ParkingSpot>",
+    "ParkingSpotAllocator.releaseSpot(int spotId): void",
+    "FeeCalculator.calculateFee(Vehicle vehicle, LocalDateTime exitTime): double",
+    "VehicleType enum: MOTORCYCLE(1.0), CAR(2.0), BUS(4.0)",
+    "ParkingSpot record: spotId, floor, supportedType, isOccupied, size",
+    "Vehicle record: licensePlate, type, entryTime, assignedSpot",
+    "ParkingTransaction record: transactionId, vehicle, entryTime, exitTime, fee"
+  ]
+}

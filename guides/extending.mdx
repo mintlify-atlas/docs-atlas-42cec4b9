@@ -1,0 +1,131 @@
+---
+title: "Extend and adapt the Smart Parking LLD Java system"
+description: "Add vehicle types, change the allocation strategy, plug in persistence, or customize fee calculation to adapt Smart Parking LLD for your use case."
+---
+
+Smart Parking LLD is designed as a reference implementation with clear separation of concerns. Each component owns a single responsibility, making it straightforward to swap out logic, add new behaviors, or integrate with external systems without touching unrelated code.
+
+## Add a new vehicle type
+
+Vehicle types are defined in the `VehicleType` enum. To add a new type (e.g., `TRUCK`), update three places:
+
+**1. Add the enum constant** with its size factor:
+
+```java VehicleType.java
+public enum VehicleType {
+    MOTORCYCLE(1.0), CAR(2.0), BUS(4.0), TRUCK(6.0); // [!code ++]
+    private final double sizeFactor;
+    VehicleType(double sizeFactor) { this.sizeFactor = sizeFactor; }
+    public double getSizeFactor() { return sizeFactor; }
+}
+```
+
+**2. Add an hourly rate** in `FeeCalculator`:
+
+```java FeeCalculator.java
+private static final Map<VehicleType, Double> HOURLY_RATES = Map.of(
+    VehicleType.MOTORCYCLE, 2.0,
+    VehicleType.CAR, 5.0,
+    VehicleType.BUS, 10.0,
+    VehicleType.TRUCK, 15.0  // [!code ++]
+);
+```
+
+**3. Update spot initialization** in `ParkingDatabase.initializeParkingSpots` to include spots designated for the new type. The current `i % 3` round-robin must be extended:
+
+```java ParkingDatabase.java
+VehicleType type = i % 4 == 0 ? VehicleType.MOTORCYCLE :
+                   i % 4 == 1 ? VehicleType.CAR :
+                   i % 4 == 2 ? VehicleType.BUS : VehicleType.TRUCK; // [!code ++]
+```
+
+<Note>
+  Changing `i % 3` to `i % 4` alters the type distribution for all existing spot types. Plan the floor layout to ensure enough capacity for each vehicle category.
+</Note>
+
+## Change the allocation strategy
+
+`ParkingSpotAllocator.allocateSpot` picks spots by sorting on floor (ascending) then spotId (ascending) — lowest floor, lowest ID wins. To change this, replace the comparator:
+
+```java ParkingSpotAllocator.java
+// Current: lowest floor, then lowest spot ID
+.min(Comparator.comparingInt(ParkingSpot::floor)
+    .thenComparingInt(ParkingSpot::spotId))
+
+// Alternative: highest floor first (e.g., keep ground floor for quick exits)
+.min(Comparator.comparingInt(ParkingSpot::floor).reversed()
+    .thenComparingInt(ParkingSpot::spotId))
+```
+
+The three `filter` steps before the sort remain unchanged — they enforce type match and size compatibility:
+
+```java
+.filter(spot -> !spot.isOccupied())
+.filter(spot -> spot.supportedType() == type)
+.filter(spot -> spot.size() >= type.getSizeFactor())
+```
+
+<Tip>
+  To implement zone-based allocation (e.g., prefer spots near an elevator), add a zone field to `ParkingSpot` and sort on it.
+</Tip>
+
+## Add persistence
+
+`ParkingDatabase` stores everything in `ConcurrentHashMap` instances — data is lost when the JVM exits. To persist sessions, hook into `ParkingManager.checkOut` after the transaction is created, or replace the maps with a persistent backing store.
+
+**Option A — write-through on checkout:**
+
+```java ParkingManager.java
+ParkingTransaction transaction = new ParkingTransaction(
+    UUID.randomUUID().toString(), vehicle, vehicle.entryTime(), exitTime, fee
+);
+database.transactions.put(transaction.transactionId(), transaction);
+persistenceService.save(transaction); // [!code ++]
+return transaction;
+```
+
+**Option B — replace the map with a DB-backed implementation:**
+
+Swap `ConcurrentHashMap` in `ParkingDatabase` for a wrapper that delegates to a database on every `put` and `get`:
+
+```java
+this.transactions = new DatabaseBackedMap<>(dataSource, "transactions");
+```
+
+<Warning>
+  Any persistence layer must maintain the same thread-safety guarantees as `ConcurrentHashMap`. Use transactions or locks at the persistence layer to avoid race conditions during concurrent checkouts.
+</Warning>
+
+## Customize fee calculation
+
+`FeeCalculator` is a simple stateless class. To support flat-rate pricing, discounts, or dynamic rates, extend or replace it:
+
+```java CustomFeeCalculator.java
+public class CustomFeeCalculator extends FeeCalculator {
+    private final double discountRate;
+
+    public CustomFeeCalculator(double discountRate) {
+        this.discountRate = discountRate;
+    }
+
+    @Override
+    public double calculateFee(Vehicle vehicle, LocalDateTime exitTime) {
+        double base = super.calculateFee(vehicle, exitTime);
+        return base * (1.0 - discountRate);
+    }
+}
+```
+
+Then pass it to `ParkingManager` — you would need to add a constructor overload that accepts a `FeeCalculator` instance:
+
+```java
+public ParkingManager(int floors, int spotsPerFloor, FeeCalculator feeCalculator) {
+    this.database = new ParkingDatabase(floors, spotsPerFloor);
+    this.allocator = new ParkingSpotAllocator(database);
+    this.feeCalculator = feeCalculator;
+}
+```
+
+<Tip>
+  For time-of-day or surge pricing, inject a `Clock` or `Supplier<LocalDateTime>` so the fee calculator can be tested without sleeping threads.
+</Tip>

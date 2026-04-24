@@ -1,80 +1,179 @@
 ---
-title: "Quickstart"
-description: "Start building awesome documentation in minutes"
+title: "Quickstart: Run Your First Smart Parking Session in Java"
+description: "Clone the repository, compile with Java 23, and perform a complete check-in, check-out, and availability query in under five minutes."
 ---
 
-## Get started in three steps
+This guide walks you through getting the Smart Parking LLD system running locally and executing your first parking session end to end. You will instantiate a `ParkingManager`, check in a vehicle, collect the fee on check-out, and query real-time spot availability — all using the exact API the system exposes.
 
-Get your documentation site running locally and make your first customization.
+## Prerequisites
 
-### Step 1: Set up your local environment
+You need **Java 23** installed and available on your `PATH`. No build tool or external dependencies are required; the project compiles with `javac` directly.
 
-<AccordionGroup>
-  <Accordion icon="copy" title="Clone your docs locally">
-    During the onboarding process, you created a GitHub repository with your docs content if you didn't already have one. You can find a link to this repository in your [dashboard](https://dashboard.mintlify.com).
-    
-    To clone the repository locally so that you can make and preview changes to your docs, follow the [Cloning a repository](https://docs.github.com/en/repositories/creating-and-managing-repositories/cloning-a-repository) guide in the GitHub docs.
-  </Accordion>
-  <Accordion icon="rectangle-terminal" title="Start the preview server">
-    1. Install the Mintlify CLI: `npm i -g mint`
-    2. Navigate to your docs directory and run: `mint dev`
-    3. Open `http://localhost:3000` to see your docs live!
-    
-    <Tip>Your preview updates automatically as you edit files.</Tip>
-  </Accordion>
-</AccordionGroup>
+<Info>
+  Verify your Java version before continuing. The project uses Java records and requires Java 23 or later.
 
-### Step 2: Deploy your changes
+  ```bash
+  java --version
+  ```
+</Info>
 
-<AccordionGroup>
-  <Accordion icon="github" title="Install our GitHub app">
-    Install the Mintlify GitHub app from your [dashboard](https://dashboard.mintlify.com/settings/organization/github-app).
-    
-    Our GitHub app automatically deploys your changes to your docs site, so you don't need to manage deployments yourself.
-</Accordion>
-<Accordion icon="palette" title="Update your site name and colors">
-    For a first change, let's update the name and colors of your docs site.
+## Steps
 
-    1. Open `docs.json` in your editor.
-    2. Change the `"name"` field to your project name.
-    3. Update the `"colors"` to match your brand.
-    4. Save and see your changes instantly at `http://localhost:3000`.
+<Steps>
+  <Step title="Clone the repository">
+    Clone the project from GitHub and navigate into the source directory.
 
-    <Tip>Try changing the primary color to see an immediate difference!</Tip>
-  </Accordion>
-</AccordionGroup>
+    ```bash
+    git clone https://github.com/bitanb1999/smartParkingLLD.git
+    cd smartParkingLLD
+    ```
+  </Step>
 
-### Step 3: Go live
+  <Step title="Compile the source">
+    Compile all Java source files from the project root. The entry point is `Main.java` in the root directory; role-based classes live under the `roles/` package.
 
-<Accordion icon="rocket" title="Publish your docs">
-  1. Commit and push your changes.
-  2. Your docs will update and be live in moments!
-</Accordion>
+    ```bash
+    javac -d out $(find . -name "*.java")
+    ```
+
+    The compiled classes are written to the `out/` directory.
+  </Step>
+
+  <Step title="Instantiate a ParkingManager">
+    `ParkingManager` is the single point of contact for all parking operations. The constructor takes the number of floors and the number of spots per floor. This example creates a three-floor lot with ten spots per floor.
+
+    ```java
+    import roles.*;
+
+    ParkingManager parkingManager = new ParkingManager(3, 10);
+    ```
+
+    Internally, this initializes the spot allocator, the session database, and a fixed thread pool of ten threads used to run async operations.
+  </Step>
+
+  <Step title="Check in a vehicle">
+    Call `checkIn` with a license plate string and a `VehicleType`. The method returns a `CompletableFuture<Vehicle>`. When the future completes, the returned `Vehicle` record carries the assigned spot.
+
+    ```java
+    parkingManager.checkIn("ABC123", VehicleType.CAR)
+        .thenAccept(vehicle ->
+            System.out.println("Assigned spot: " + vehicle.assignedSpot().spotId()))
+        .exceptionally(throwable -> {
+            System.err.println("Error: " + throwable.getMessage());
+            return null;
+        });
+    ```
+
+    <Warning>
+      If no spot is available for the requested vehicle type, the future completes exceptionally with an `IllegalStateException`. Always attach an `.exceptionally()` handler so the calling thread is notified rather than silently swallowing the failure.
+    </Warning>
+  </Step>
+
+  <Step title="Check out and collect the fee">
+    Call `checkOut` with the same license plate used at check-in. The method returns a `CompletableFuture<ParkingTransaction>`. The transaction record contains the computed fee based on the actual parking duration and the vehicle type's hourly rate.
+
+    ```java
+    parkingManager.checkOut("ABC123")
+        .thenAccept(transaction ->
+            System.out.println("Fee: $" + transaction.fee()))
+        .exceptionally(throwable -> {
+            System.err.println("Error: " + throwable.getMessage());
+            return null;
+        });
+    ```
+
+    Hourly rates by vehicle type:
+
+    | Vehicle type | Rate    |
+    | ------------ | ------- |
+    | `MOTORCYCLE` | $2/hr   |
+    | `CAR`        | $5/hr   |
+    | `BUS`        | $10/hr  |
+
+    Checking out a license plate that was never checked in completes the future exceptionally.
+  </Step>
+
+  <Step title="Query available spots">
+    `getAvailableSpots` is a synchronous call that returns the current count of unoccupied spots compatible with a given vehicle type. You can call it at any time without affecting system state.
+
+    ```java
+    int available = parkingManager.getAvailableSpots(VehicleType.CAR);
+    System.out.println("Available car spots: " + available);
+    ```
+
+    <Tip>
+      Use `getAvailableSpots` before calling `checkIn` if you want to surface a user-friendly "lot full" message rather than catching the `IllegalStateException` from the future.
+    </Tip>
+  </Step>
+
+  <Step title="Run the program">
+    Execute the compiled entry point with the `out/` directory on the classpath.
+
+    ```bash
+    java -cp out Main
+    ```
+
+    You should see output similar to:
+
+    ```text
+    Assigned spot: 2
+    Available car spots: 8
+    Fee: $5.00
+    ```
+
+    Exact spot IDs and fees depend on parking duration and floor layout.
+  </Step>
+</Steps>
+
+## Complete example
+
+The following is the full `Main.java` entry point, combining all the operations above in sequence:
+
+```java
+import roles.*;
+
+class Main {
+    public static void main(String[] args) {
+        ParkingManager parkingManager = new ParkingManager(3, 10);
+
+        // Check in a CAR with license plate "ABC123"
+        parkingManager.checkIn("ABC123", VehicleType.CAR)
+            .thenAccept(vehicle ->
+                System.out.println("Assigned spot: " + vehicle.assignedSpot().spotId()))
+            .exceptionally(throwable -> {
+                System.err.println("Error: " + throwable.getMessage());
+                return null;
+            });
+
+        // Check out the same vehicle and print the fee
+        parkingManager.checkOut("ABC123")
+            .thenAccept(transaction ->
+                System.out.println("Fee: $" + transaction.fee()))
+            .exceptionally(throwable -> {
+                System.err.println("Error: " + throwable.getMessage());
+                return null;
+            });
+
+        // Query how many car spots remain
+        System.out.println("Available car spots: " +
+            parkingManager.getAvailableSpots(VehicleType.CAR));
+    }
+}
+```
 
 ## Next steps
 
-Now that you have your docs running, explore these key features:
-
 <CardGroup cols={2}>
-
-<Card title="Write Content" icon="pen-to-square" href="/essentials/markdown">
-  Learn MDX syntax and start writing your documentation.
-</Card>
-
-<Card title="Customize style" icon="palette" href="/essentials/settings">
-  Make your docs match your brand perfectly.
-</Card>
-
-<Card title="Add code examples" icon="square-code" href="/essentials/code">
-  Include syntax-highlighted code blocks.
-</Card>
-
-<Card title="API documentation" icon="code" href="/api-reference/introduction">
-  Auto-generate API docs from OpenAPI specs.
-</Card>
-
+  <Card title="Architecture overview" icon="diagram-project" href="/architecture/overview">
+    Understand how the four components connect and how concurrency is managed across floors.
+  </Card>
+  <Card title="Vehicle check-in guide" icon="car" href="/guides/vehicle-checkin">
+    Deep-dive into the check-in flow, spot selection strategy, and edge cases.
+  </Card>
+  <Card title="Fee calculator" icon="calculator" href="/components/fee-calculator">
+    See how duration and vehicle type combine to produce the final fee.
+  </Card>
+  <Card title="Spot availability" icon="circle-check" href="/guides/spot-availability">
+    Learn how availability is tracked in real time across concurrent operations.
+  </Card>
 </CardGroup>
-
-<Note>
-  **Need help?** See our [full documentation](https://mintlify.com/docs) or join our [community](https://mintlify.com/community).
-</Note>

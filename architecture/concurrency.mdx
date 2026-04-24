@@ -1,0 +1,166 @@
+---
+title: "Concurrency model: locks, maps, and async futures in Java"
+description: "How Smart Parking achieves thread safety through ConcurrentHashMap, ReentrantReadWriteLock, and CompletableFuture with a fixed 10-thread executor pool."
+---
+
+Smart Parking uses three distinct concurrency mechanisms, each operating at a different layer of the system. At the collection level, `ConcurrentHashMap` provides lock-free concurrent access to the data store. At the business-logic level, a `ReentrantReadWriteLock` serializes spot allocation and release to prevent double-booking. At the API level, `CompletableFuture` with a fixed-thread executor pool makes check-in and check-out non-blocking for callers. Understanding where each mechanism applies — and why — is essential for reasoning about the system's behavior under load.
+
+## Layer 1: ConcurrentHashMap
+
+All three data collections in `ParkingDatabase` are `ConcurrentHashMap` instances:
+
+```java
+this.spots = new ConcurrentHashMap<>();
+this.activeVehicles = new ConcurrentHashMap<>();
+this.transactions = new ConcurrentHashMap<>();
+```
+
+`ConcurrentHashMap` provides atomic `put`, `get`, and `remove` operations without a global lock. This means reads from multiple threads are safe without any external coordination, and individual writes do not block unrelated keys.
+
+<Note>
+  `ConcurrentHashMap` alone is not sufficient for multi-step operations like spot allocation. A thread could read a spot as unoccupied, be preempted, and then find it already taken when it attempts to write. This is why `ReentrantReadWriteLock` is layered on top for allocation logic.
+</Note>
+
+## Layer 2: ReentrantReadWriteLock
+
+`ParkingDatabase` declares a single `ReentrantReadWriteLock`:
+
+```java
+public ReadWriteLock lock = new ReentrantReadWriteLock();
+```
+
+This lock is used in two modes depending on the operation:
+
+### Write lock: allocateSpot and releaseSpot
+
+Both `allocateSpot` and `releaseSpot` acquire the write lock before touching `database.spots`. The write lock is exclusive — no other thread can hold a read or write lock simultaneously.
+
+```java
+public Optional<ParkingSpot> allocateSpot(VehicleType type) {
+    database.lock.writeLock().lock();
+    try {
+        return database.spots.values().stream()
+            .filter(spot -> !spot.isOccupied())
+            .filter(spot -> spot.supportedType() == type)
+            .filter(spot -> spot.size() >= type.getSizeFactor())
+            .min(Comparator.comparingInt(ParkingSpot::floor)
+                .thenComparingInt(ParkingSpot::spotId))
+            .map(spot -> {
+                ParkingSpot occupiedSpot = new ParkingSpot(
+                    spot.spotId(), spot.floor(), spot.supportedType(), true, spot.size()
+                );
+                database.spots.put(spot.spotId(), occupiedSpot);
+                return occupiedSpot;
+            });
+    } finally {
+        database.lock.writeLock().unlock();
+    }
+}
+```
+
+The lock is released in a `finally` block, guaranteeing it is freed even if the stream throws. Without this lock, two threads could both observe the same spot as unoccupied, both claim it, and produce a double-booking.
+
+```java
+public void releaseSpot(int spotId) {
+    database.lock.writeLock().lock();
+    try {
+        ParkingSpot spot = database.spots.get(spotId);
+        if (spot != null) {
+            ParkingSpot freeSpot = new ParkingSpot(
+                spot.spotId(), spot.floor(), spot.supportedType(), false, spot.size()
+            );
+            database.spots.put(spot.spotId(), freeSpot);
+        }
+    } finally {
+        database.lock.writeLock().unlock();
+    }
+}
+```
+
+### Read lock: getAvailableSpots
+
+`ParkingManager.getAvailableSpots` acquires the read lock, which allows multiple threads to read concurrently as long as no write lock is held:
+
+```java
+public int getAvailableSpots(VehicleType type) {
+    database.lock.readLock().lock();
+    try {
+        return (int) database.spots.values().stream()
+            .filter(spot -> !spot.isOccupied())
+            .filter(spot -> spot.supportedType() == type)
+            .count();
+    } finally {
+        database.lock.readLock().unlock();
+    }
+}
+```
+
+This means availability queries from multiple callers can run in parallel, but will block if a write lock (from an ongoing allocation or release) is held.
+
+<Warning>
+  The write lock on `allocateSpot` serializes all spot assignments through a single critical section. Under high concurrent load, this becomes a bottleneck — every check-in must wait for the previous allocation to complete before the lock is released. This is the correct trade-off for correctness, but it is worth noting when estimating throughput.
+</Warning>
+
+## Layer 3: CompletableFuture and ExecutorService
+
+`ParkingManager` creates a fixed thread pool at construction time:
+
+```java
+private final ExecutorService executor = Executors.newFixedThreadPool(10);
+```
+
+`checkIn` and `checkOut` both submit their work to this pool using `CompletableFuture.supplyAsync`:
+
+```java
+public CompletableFuture<Vehicle> checkIn(String licensePlate, VehicleType type) {
+    return CompletableFuture.supplyAsync(() -> {
+        Optional<ParkingSpot> spot = allocator.allocateSpot(type);
+        if (spot.isEmpty()) {
+            throw new IllegalStateException("No available parking spots");
+        }
+        Vehicle vehicle = new Vehicle(licensePlate, type, LocalDateTime.now(), spot.get());
+        database.activeVehicles.put(licensePlate, vehicle);
+        return vehicle;
+    }, executor);
+}
+
+public CompletableFuture<ParkingTransaction> checkOut(String licensePlate) {
+    return CompletableFuture.supplyAsync(() -> {
+        Vehicle vehicle = database.activeVehicles.remove(licensePlate);
+        if (vehicle == null) {
+            throw new IllegalStateException("Vehicle not found");
+        }
+        LocalDateTime exitTime = LocalDateTime.now();
+        double fee = feeCalculator.calculateFee(vehicle, exitTime);
+        allocator.releaseSpot(vehicle.assignedSpot().spotId());
+        ParkingTransaction transaction = new ParkingTransaction(
+            UUID.randomUUID().toString(), vehicle, vehicle.entryTime(), exitTime, fee
+        );
+        database.transactions.put(transaction.transactionId(), transaction);
+        return transaction;
+    }, executor);
+}
+```
+
+Callers receive a `CompletableFuture` immediately and are free to continue execution while the operation runs on the pool. Errors surface as exceptions on the future rather than as checked return values, so callers use `.exceptionally` or `.handle` to react to failures.
+
+<Tip>
+  With a pool of 10 threads, up to 10 check-in or check-out operations can run concurrently. However, because allocation acquires a write lock, the concurrent futures will still serialize through the lock during the allocation step. The async model primarily benefits I/O-bound work; here it provides a clean non-blocking API boundary.
+</Tip>
+
+## Why records are inherently thread-safe
+
+All domain objects — `ParkingSpot`, `Vehicle`, and `ParkingTransaction` — are Java records. Records are deeply immutable: every component is assigned once at construction and exposed only through accessor methods that return the stored value. There are no setters, no mutable fields, and no internal state that can change after creation.
+
+This means a `Vehicle` or `ParkingSpot` can be passed between threads, stored in futures, and read by multiple threads simultaneously without any synchronization. The only shared mutable state in the entire system is the three maps in `ParkingDatabase`, and those are protected by `ConcurrentHashMap` semantics and the `ReentrantReadWriteLock`.
+
+## Concurrency guarantees at a glance
+
+| Operation | Mechanism | Behavior under concurrency |
+|---|---|---|
+| `checkIn` | `CompletableFuture` + write lock | Non-blocking for caller; allocation serialized |
+| `checkOut` | `CompletableFuture` + write lock | Non-blocking for caller; release serialized |
+| `getAvailableSpots` | Read lock | Multiple callers can run in parallel |
+| `activeVehicles.put` / `.remove` | `ConcurrentHashMap` | Atomic, no additional locking needed |
+| `transactions.put` | `ConcurrentHashMap` | Atomic, no additional locking needed |
+| Domain objects | Java records | Immutable, safe to share without locks |

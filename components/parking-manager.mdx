@@ -1,0 +1,130 @@
+---
+title: "ParkingManager: async facade for the parking system"
+description: "ParkingManager is the public API entry point, coordinating spot allocation, fees, and session storage via CompletableFuture on a 10-thread executor pool."
+---
+
+`ParkingManager` is the top-level coordinator for the entire parking system. It owns a fixed thread pool of 10 threads and delegates every operation to the three internal components it creates: `ParkingSpotAllocator`, `FeeCalculator`, and `ParkingDatabase`. All public operations that mutate state return `CompletableFuture`, keeping the calling thread free while work runs on the executor. Read-only queries like `getAvailableSpots` execute synchronously under a read lock and return immediately.
+
+## Constructor
+
+```java
+public ParkingManager(int floors, int spotsPerFloor)
+```
+
+Creates all internal components and initializes the parking lot with the given layout. The database is constructed first, then passed into the allocator. The fee calculator is stateless and requires no references.
+
+<ParamField path="floors" type="int" required>
+  Number of floors in the parking structure. Spots are numbered sequentially across floors, starting at floor 1.
+</ParamField>
+
+<ParamField path="spotsPerFloor" type="int" required>
+  Number of parking spots per floor. Spots are assigned a vehicle type using an `i % 3` round-robin pattern: index 0 → `MOTORCYCLE`, index 1 → `CAR`, index 2 → `BUS`.
+</ParamField>
+
+```java
+// Create a 3-floor lot with 12 spots per floor (36 spots total)
+ParkingManager manager = new ParkingManager(3, 12);
+```
+
+## Methods
+
+### checkIn
+
+```java
+public CompletableFuture<Vehicle> checkIn(String licensePlate, VehicleType type)
+```
+
+Assigns an available spot to the vehicle and opens a parking session. The method submits work to the internal executor, which calls `ParkingSpotAllocator.allocateSpot` under a write lock. If a matching spot is found, a `Vehicle` record is created with the current timestamp and stored in `database.activeVehicles`. The future resolves with the `Vehicle` record on success, or completes exceptionally with `IllegalStateException` if no compatible spot is available.
+
+<ParamField path="licensePlate" type="String" required>
+  The vehicle's license plate string, used as the key for active session lookup and retrieval at checkout. Must be unique among currently parked vehicles.
+</ParamField>
+
+<ParamField path="type" type="VehicleType" required>
+  The vehicle type — `MOTORCYCLE`, `CAR`, or `BUS`. Only spots whose `supportedType` matches and whose `size` is at least `type.getSizeFactor()` are considered.
+</ParamField>
+
+<Warning>
+  If no spot is available for the given `VehicleType`, the returned `CompletableFuture` completes exceptionally with `IllegalStateException("No available parking spots")`. Always handle this case with `.exceptionally` or `.handle`.
+</Warning>
+
+```java
+manager.checkIn("ABC-1234", VehicleType.CAR)
+    .thenAccept(vehicle -> {
+        System.out.println("Parked at spot " + vehicle.assignedSpot().spotId()
+            + " on floor " + vehicle.assignedSpot().floor());
+    })
+    .exceptionally(ex -> {
+        System.err.println("Check-in failed: " + ex.getMessage());
+        return null;
+    });
+```
+
+### checkOut
+
+```java
+public CompletableFuture<ParkingTransaction> checkOut(String licensePlate)
+```
+
+Ends a parking session and produces a completed transaction. The method submits work to the executor, which atomically removes the vehicle from `database.activeVehicles`, computes the fee using `FeeCalculator.calculateFee`, releases the spot via `ParkingSpotAllocator.releaseSpot`, and writes a `ParkingTransaction` with a UUID to `database.transactions`. The future resolves with the completed `ParkingTransaction`.
+
+<ParamField path="licensePlate" type="String" required>
+  The license plate used at check-in. If no active session exists for this plate, the future completes exceptionally with `IllegalStateException("Vehicle not found")`.
+</ParamField>
+
+<Warning>
+  If the license plate is not found in active sessions, the future completes exceptionally with `IllegalStateException("Vehicle not found")`. The spot is not released and no transaction is recorded in this case.
+</Warning>
+
+```java
+manager.checkOut("ABC-1234")
+    .thenAccept(transaction -> {
+        System.out.printf("Transaction %s — fee: $%.2f%n",
+            transaction.transactionId(), transaction.fee());
+    })
+    .exceptionally(ex -> {
+        System.err.println("Check-out failed: " + ex.getMessage());
+        return null;
+    });
+```
+
+### getAvailableSpots
+
+```java
+public int getAvailableSpots(VehicleType type)
+```
+
+Returns the count of unoccupied spots that support the given vehicle type. This method runs synchronously on the calling thread, acquiring the read lock for the duration of the stream traversal. Multiple threads can call this concurrently without blocking each other, but they will block if a write lock is held by an ongoing allocation or release.
+
+<ParamField path="type" type="VehicleType" required>
+  The vehicle type to query. Only spots whose `supportedType` exactly matches this value and whose `isOccupied()` is `false` are counted.
+</ParamField>
+
+```java
+int availableCars = manager.getAvailableSpots(VehicleType.CAR);
+System.out.println("Available CAR spots: " + availableCars);
+
+int availableMotorcycles = manager.getAvailableSpots(VehicleType.MOTORCYCLE);
+int availableBuses = manager.getAvailableSpots(VehicleType.BUS);
+```
+
+<Note>
+  `getAvailableSpots` is a point-in-time snapshot. The count may change immediately after the read lock is released if concurrent check-ins or check-outs are in progress.
+</Note>
+
+## Internal structure
+
+<CardGroup cols={2}>
+  <Card title="ParkingSpotAllocator" icon="map-pin" href="/components/spot-allocator">
+    Selects and releases spots using write-lock-protected stream queries.
+  </Card>
+  <Card title="FeeCalculator" icon="calculator" href="/components/fee-calculator">
+    Computes parking fees by rounding duration up to the nearest hour.
+  </Card>
+  <Card title="ParkingDatabase" icon="database" href="/components/parking-database">
+    Holds all in-memory state: spots, active vehicles, and completed transactions.
+  </Card>
+  <Card title="Architecture overview" icon="sitemap" href="/architecture/overview">
+    See how all four components collaborate and data flows through each operation.
+  </Card>
+</CardGroup>

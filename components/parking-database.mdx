@@ -1,0 +1,97 @@
+---
+title: "ParkingDatabase: shared in-memory state for the parking lot"
+description: "ParkingDatabase stores spots, active vehicles, and completed transactions in ConcurrentHashMaps, with a ReentrantReadWriteLock for allocation consistency."
+---
+
+`ParkingDatabase` is not a traditional data access object and performs no I/O. It is a shared in-memory store — a plain Java class that holds three `ConcurrentHashMap` instances and a `ReentrantReadWriteLock`, and is accessed directly by `ParkingSpotAllocator` and `ParkingManager`. Keeping all state in one place makes the access patterns explicit: every component that reads or writes parking state must go through this object and must respect the locking contract it provides.
+
+## Collections
+
+### spots
+
+```java
+public Map<Integer, ParkingSpot> spots;
+```
+
+Maps spot ID (an `int`) to its current `ParkingSpot` record. Because `ParkingSpot` is an immutable record, every allocation or release replaces the entry with a new record rather than mutating the existing one. The map is backed by `ConcurrentHashMap` for safe concurrent reads, but write operations (allocation and release) are additionally guarded by the write lock to ensure atomicity across the read-modify-write cycle.
+
+### activeVehicles
+
+```java
+public Map<String, Vehicle> activeVehicles;
+```
+
+Maps license plate (a `String`) to the `Vehicle` record created at check-in. An entry is added by `ParkingManager.checkIn` and removed atomically by `ParkingManager.checkOut` using `ConcurrentHashMap.remove`, which returns the removed value in a single thread-safe step.
+
+### transactions
+
+```java
+public Map<String, ParkingTransaction> transactions;
+```
+
+Maps transaction ID (a UUID string) to the completed `ParkingTransaction` record. Entries are written by `ParkingManager.checkOut` after the fee is computed and the spot is released. This map is append-only in normal operation — no entries are ever removed.
+
+## Locking
+
+```java
+public ReadWriteLock lock = new ReentrantReadWriteLock();
+```
+
+The `ReadWriteLock` coordinates access to the `spots` map across components. Multiple readers can hold the read lock simultaneously — `ParkingManager.getAvailableSpots` acquires it for its stream query. Writers must hold the exclusive write lock — `ParkingSpotAllocator.allocateSpot` and `releaseSpot` both acquire it before modifying `spots`.
+
+<Note>
+  The lock protects only the `spots` map. `activeVehicles` and `transactions` rely on `ConcurrentHashMap`'s built-in thread safety because the operations on those maps (`put` at check-in, `remove` at check-out) are single-step and do not require a read-modify-write cycle.
+</Note>
+
+## Initialization
+
+```java
+public ParkingDatabase(int floors, int spotsPerFloor) {
+    this.spots = new ConcurrentHashMap<>();
+    this.activeVehicles = new ConcurrentHashMap<>();
+    this.transactions = new ConcurrentHashMap<>();
+    initializeParkingSpots(floors, spotsPerFloor);
+}
+```
+
+Spot IDs are assigned sequentially starting at 1, iterating floor by floor. Within each floor, the vehicle type is determined by the spot index `i` using a round-robin `i % 3` pattern:
+
+```java
+VehicleType type = i % 3 == 0 ? VehicleType.MOTORCYCLE :
+                 i % 3 == 1 ? VehicleType.CAR : VehicleType.BUS;
+```
+
+#### Example layout: 3 floors × 10 spots = 30 total spots
+
+| Spot index per floor (i) | Vehicle type | Examples (floor 1) |
+|---|---|---|
+| 0, 3, 6, 9 | `MOTORCYCLE` | Spots 1, 4, 7, 10 |
+| 1, 4, 7 | `CAR` | Spots 2, 5, 8 |
+| 2, 5, 8 | `BUS` | Spots 3, 6, 9 |
+
+Floor 2 continues from spot 11, floor 3 from spot 21, with the same type pattern repeating on each floor.
+
+Each spot is initialized with `isOccupied = false` and a `size` equal to `type.getSizeFactor()`:
+
+```java
+spots.put(spotId, new ParkingSpot(spotId, floor, type, false, type.getSizeFactor()));
+```
+
+<Tip>
+  The `size` field is set to `type.getSizeFactor()` at initialization, which means each spot is exactly the right size for its designated type. The size filter in `ParkingSpotAllocator.allocateSpot` (`spot.size() >= type.getSizeFactor()`) will always pass for correctly typed spots and always fail for mismatched types, making the type and size filters effectively redundant by design. The size filter provides headroom if you later introduce mixed-size spots.
+</Tip>
+
+## Design note
+
+Exposing the maps and lock as `public` fields rather than through accessor methods is an intentional design choice for this LLD: it keeps the code concise and makes data flow easy to follow during design review. In a production system, you would replace direct field access with methods that enforce the locking contract internally.
+
+## Related components
+
+<CardGroup cols={2}>
+  <Card title="ParkingSpotAllocator" icon="map-pin" href="/components/spot-allocator">
+    Acquires the write lock on every allocation and release, then updates the spots map.
+  </Card>
+  <Card title="ParkingManager" icon="sitemap" href="/components/parking-manager">
+    Reads activeVehicles and spots directly; creates the database instance in its constructor.
+  </Card>
+</CardGroup>

@@ -1,0 +1,161 @@
+---
+title: "Check in a vehicle and assign it a parking spot in Java"
+description: "Call ParkingManager.checkIn with a license plate and vehicle type to open a session, receive spot details, and handle the no-availability error path."
+---
+
+Checking a vehicle into the parking lot is the first action in every parking session. You call `ParkingManager.checkIn` with the vehicle's license plate and type; the system finds the lowest available compatible spot, records the entry timestamp, and returns a `Vehicle` record carrying all the session details. The operation is asynchronous — it runs on the internal executor thread pool and resolves as a `CompletableFuture<Vehicle>`.
+
+## Before you check in
+
+Check available spots for the vehicle type before calling `checkIn`. This lets you surface a user-friendly message — such as a gate display or an API response — rather than catching an exception on the future.
+
+```java
+int available = parkingManager.getAvailableSpots(VehicleType.CAR);
+if (available == 0) {
+    System.out.println("No car spots available. Please try another time.");
+    return;
+}
+```
+
+<Tip>
+  `getAvailableSpots` acquires a read lock and returns a point-in-time count. In high-concurrency scenarios a spot may be taken between this call and the `checkIn` call, so always attach an `.exceptionally` handler regardless.
+</Tip>
+
+## Steps
+
+<Steps>
+  <Step title="Instantiate ParkingManager">
+    Create a `ParkingManager` with your lot dimensions. The constructor initializes spots across all floors, assigning types in a round-robin pattern (`i % 3`: index 0 → `MOTORCYCLE`, 1 → `CAR`, 2 → `BUS`).
+
+    ```java
+    import roles.*;
+
+    ParkingManager parkingManager = new ParkingManager(3, 10);
+    ```
+  </Step>
+
+  <Step title="Call checkIn">
+    Pass the license plate string and the `VehicleType`. The method submits work to the internal executor and returns immediately with a `CompletableFuture`.
+
+    ```java
+    parkingManager.checkIn("MX-4821", VehicleType.CAR)
+        .thenAccept(vehicle -> {
+            System.out.println("Checked in: " + vehicle.licensePlate());
+            System.out.println("Type: "        + vehicle.type());
+            System.out.println("Entry time: "  + vehicle.entryTime());
+            System.out.println("Spot ID: "     + vehicle.assignedSpot().spotId());
+            System.out.println("Floor: "       + vehicle.assignedSpot().floor());
+        })
+        .exceptionally(throwable -> {
+            System.err.println("Check-in failed: " + throwable.getMessage());
+            return null;
+        });
+    ```
+  </Step>
+
+  <Step title="Read the Vehicle record">
+    When the future resolves successfully, you receive a `Vehicle` record with four fields:
+
+    | Field | Type | Description |
+    | --- | --- | --- |
+    | `licensePlate()` | `String` | The plate string passed to `checkIn`. |
+    | `type()` | `VehicleType` | `MOTORCYCLE`, `CAR`, or `BUS`. |
+    | `entryTime()` | `LocalDateTime` | Timestamp captured at the moment of allocation. |
+    | `assignedSpot()` | `ParkingSpot` | The spot the allocator selected. |
+
+    Access spot details directly from the nested `ParkingSpot` record:
+
+    ```java
+    ParkingSpot spot = vehicle.assignedSpot();
+    int spotId  = spot.spotId();   // unique spot number across the lot
+    int floor   = spot.floor();    // floor number (1-indexed)
+    double size = spot.size();     // size factor of the spot
+    ```
+  </Step>
+
+  <Step title="Handle the error case">
+    If no compatible spot is available, the future completes exceptionally with:
+
+    ```
+    IllegalStateException: No available parking spots
+    ```
+
+    The `.exceptionally` handler receives the exception wrapped in a `CompletionException`. Unwrap with `throwable.getMessage()` or `throwable.getCause()`.
+
+    <Warning>
+      Omitting the `.exceptionally` handler causes the exception to be silently swallowed by the `CompletableFuture`. The calling thread will never see the failure.
+    </Warning>
+  </Step>
+</Steps>
+
+## Examples by vehicle type
+
+The `checkIn` API is identical for all three vehicle types. Only the `VehicleType` argument changes.
+
+<CodeGroup>
+
+```java MOTORCYCLE
+parkingManager.checkIn("MOTO-001", VehicleType.MOTORCYCLE)
+    .thenAccept(vehicle -> {
+        System.out.println("Motorcycle assigned to spot "
+            + vehicle.assignedSpot().spotId()
+            + " on floor " + vehicle.assignedSpot().floor());
+    })
+    .exceptionally(throwable -> {
+        System.err.println("No motorcycle spots: " + throwable.getMessage());
+        return null;
+    });
+```
+
+```java CAR
+parkingManager.checkIn("CAR-4821", VehicleType.CAR)
+    .thenAccept(vehicle -> {
+        System.out.println("Car assigned to spot "
+            + vehicle.assignedSpot().spotId()
+            + " on floor " + vehicle.assignedSpot().floor());
+    })
+    .exceptionally(throwable -> {
+        System.err.println("No car spots: " + throwable.getMessage());
+        return null;
+    });
+```
+
+```java BUS
+parkingManager.checkIn("BUS-77B", VehicleType.BUS)
+    .thenAccept(vehicle -> {
+        System.out.println("Bus assigned to spot "
+            + vehicle.assignedSpot().spotId()
+            + " on floor " + vehicle.assignedSpot().floor());
+    })
+    .exceptionally(throwable -> {
+        System.err.println("No bus spots: " + throwable.getMessage());
+        return null;
+    });
+```
+
+</CodeGroup>
+
+## What happens internally
+
+When `checkIn` is called, the executor runs the following sequence on a background thread:
+
+1. `ParkingSpotAllocator.allocateSpot(type)` acquires a **write lock** and finds the first unoccupied spot whose `supportedType` matches, sorted by floor ascending then spot ID ascending.
+2. A `Vehicle` record is constructed with the license plate, type, `LocalDateTime.now()`, and the allocated spot.
+3. The record is stored in `database.activeVehicles` under the license plate key.
+4. The spot is marked as occupied in the database.
+5. The future resolves with the `Vehicle` record.
+
+<Note>
+  The allocation strategy always prefers the lowest floor and lowest spot ID first. In a fresh three-floor lot, the first car check-in receives the car spot on floor 1 with the smallest ID — typically spot index 1 on floor 1.
+</Note>
+
+## Related guides
+
+<CardGroup cols={2}>
+  <Card title="Vehicle check-out" icon="circle-dollar-sign" href="/guides/vehicle-checkout">
+    End a parking session, compute the fee, and release the spot.
+  </Card>
+  <Card title="Spot availability" icon="circle-check" href="/guides/spot-availability">
+    Query how many spots remain before calling checkIn.
+  </Card>
+</CardGroup>

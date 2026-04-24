@@ -1,0 +1,122 @@
+---
+title: "Check out a vehicle and collect the computed parking fee"
+description: "Learn how to check out a parked vehicle, release its spot, and compute the time-based fee using ParkingManager.checkOut in Smart Parking LLD."
+---
+
+When a vehicle leaves the lot, `ParkingManager.checkOut` handles everything in one atomic operation: it removes the vehicle from active tracking, computes the parking fee based on actual duration, releases the spot for the next arrival, and records the completed session as a `ParkingTransaction`.
+
+## How checkout works
+
+Calling `checkOut` with a license plate triggers the following steps atomically inside the executor thread pool:
+
+1. The vehicle is removed from `activeVehicles` — it is no longer considered parked.
+2. The current time is captured as `exitTime`.
+3. `FeeCalculator.calculateFee` computes the charge based on duration and vehicle type.
+4. The allocated spot is released via `ParkingSpotAllocator.releaseSpot`.
+5. A `ParkingTransaction` record is created with a UUID and stored in `transactions`.
+
+<Steps>
+  <Step title="Call checkOut with the license plate">
+    Pass the exact license plate string used at check-in. The method returns a `CompletableFuture<ParkingTransaction>`.
+
+    ```java
+    manager.checkOut("ABC123")
+        .thenAccept(tx -> {
+            System.out.println("Transaction ID: " + tx.transactionId());
+            System.out.println("Fee: $" + tx.fee());
+            System.out.println("Entry: " + tx.entryTime());
+            System.out.println("Exit:  " + tx.exitTime());
+        })
+        .exceptionally(throwable -> {
+            System.err.println("Checkout failed: " + throwable.getMessage());
+            return null;
+        });
+    ```
+  </Step>
+
+  <Step title="Read the ParkingTransaction fields">
+    The resolved `ParkingTransaction` record contains everything about the completed session:
+
+    | Field | Type | Description |
+    |---|---|---|
+    | `transactionId` | `String` | UUID generated at checkout |
+    | `vehicle` | `Vehicle` | The full vehicle record including assigned spot |
+    | `entryTime` | `LocalDateTime` | When the vehicle checked in |
+    | `exitTime` | `LocalDateTime` | When the vehicle checked out |
+    | `fee` | `double` | Total charge in dollars |
+
+    ```java
+    .thenAccept(tx -> {
+        String plate = tx.vehicle().licensePlate();
+        int spotId   = tx.vehicle().assignedSpot().spotId();
+        double fee   = tx.fee();
+        System.out.printf("Vehicle %s left spot %d. Charge: $%.2f%n", plate, spotId, fee);
+    });
+    ```
+  </Step>
+
+  <Step title="Handle the vehicle-not-found error">
+    If the license plate was never checked in (or was already checked out), `checkOut` throws `IllegalStateException("Vehicle not found")` inside the future.
+
+    ```java
+    manager.checkOut("UNKNOWN")
+        .exceptionally(throwable -> {
+            // throwable.getCause() is IllegalStateException("Vehicle not found")
+            System.err.println("Error: " + throwable.getCause().getMessage());
+            return null;
+        });
+    ```
+
+    <Warning>
+      Calling `checkOut` twice with the same plate will fail on the second call. `activeVehicles.remove` is atomic but the second call finds no entry.
+    </Warning>
+  </Step>
+</Steps>
+
+## Fee calculation
+
+Fees are calculated by `FeeCalculator.calculateFee` using ceiling-rounded hours:
+
+```java
+Duration duration = Duration.between(vehicle.entryTime(), exitTime);
+double hours = duration.toHours() + (duration.toMinutesPart() > 0 ? 1 : 0);
+return hours * HOURLY_RATES.get(vehicle.type());
+```
+
+Any partial hour counts as a full hour. Examples:
+
+| Duration | Vehicle | Hours billed | Fee |
+|---|---|---|---|
+| 45 min | CAR | 1 | $5.00 |
+| 1h 00min | CAR | 1 | $5.00 |
+| 1h 30min | CAR | 2 | $10.00 |
+| 2h 01min | MOTORCYCLE | 3 | $6.00 |
+| 3h 00min | BUS | 3 | $30.00 |
+
+**Hourly rates:**
+
+| Vehicle type | Rate |
+|---|---|
+| MOTORCYCLE | $2 / hr |
+| CAR | $5 / hr |
+| BUS | $10 / hr |
+
+<Tip>
+  For billing systems, use `tx.transactionId()` as a receipt reference — it is a UUID unique to each session and stored in `ParkingDatabase.transactions`.
+</Tip>
+
+## Complete checkout examples
+
+```java
+ParkingManager manager = new ParkingManager(3, 10);
+
+// After a CAR has been parked for ~90 minutes...
+manager.checkOut("ABC123")
+    .thenAccept(tx -> System.out.printf("Fee: $%.2f%n", tx.fee())) // $10.00
+    .exceptionally(ex -> { System.err.println(ex.getCause().getMessage()); return null; });
+
+// After a MOTORCYCLE has been parked for ~45 minutes...
+manager.checkOut("MOTO99")
+    .thenAccept(tx -> System.out.printf("Fee: $%.2f%n", tx.fee())) // $2.00
+    .exceptionally(ex -> { System.err.println(ex.getCause().getMessage()); return null; });
+```
